@@ -1,0 +1,647 @@
+<?php
+require_once __DIR__ . '/../includes/init.php';
+
+// Get judge ID from URL parameter
+$judge_id = isset($_GET['id']) ? (int)$_GET['id'] : null;
+
+// Fetch judge details if ID is provided
+$judge = null;
+if ($judge_id) {
+    $judge = $db->query("SELECT * FROM judges WHERE id = ?", [$judge_id])->fetch();
+    if (!$judge) {
+        header('Location: /judge/');
+        exit;
+    }
+}
+
+// Fetch all judges if no specific judge is selected
+$all_judges = $db->query("SELECT * FROM judges ORDER BY display_name")->fetchAll();
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Add or update score
+    if (isset($_POST['action']) && $_POST['action'] === 'assign_points') {
+        try {
+            // Get user name for the notification message
+            $user_name = $db->query("SELECT name FROM users WHERE id = ?", [$_POST['user_id']])->fetchColumn();
+            
+            // Check if this judge has already scored this user
+            $existing_score = $db->query(
+                "SELECT id FROM scores WHERE judge_id = ? AND user_id = ?", 
+                [$_POST['judge_id'], $_POST['user_id']]
+            )->fetchColumn();
+            
+            if ($existing_score) {
+                // Update existing score
+                $db->update('scores', [
+                    'points' => $_POST['points']
+                ], 'id = ?', [$existing_score]);
+                
+                $message_type = 'updated';
+            } else {
+                // Insert new score
+                $db->insert('scores', [
+                    'judge_id' => $_POST['judge_id'],
+                    'user_id' => $_POST['user_id'],
+                    'points' => $_POST['points']
+                ]);
+                
+                $message_type = 'assigned';
+            }
+            
+            // Set success message using helper function
+            setToast('success', 
+                'Score ' . ucfirst($message_type), 
+                'You ' . $message_type . ' ' . (int)$_POST['points'] . ' points to ' . htmlspecialchars($user_name) . '.'
+            );
+        } catch (Exception $e) {
+            // Set error message using helper function
+            setToast('error',
+                'Error',
+                'Failed to assign points: ' . $e->getMessage()
+            );
+        }
+        
+        // Redirect to prevent form resubmission
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?id=' . $_POST['judge_id']);
+        exit;
+    }
+}
+
+// Get all users with their scores from this judge (if any)
+$users = $db->query("
+    SELECT 
+        u.id, 
+        u.name, 
+        COALESCE(s.points, 0) as points,
+        s.id as score_id,
+        CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END as has_voted
+    FROM users u
+    LEFT JOIN scores s ON u.id = s.user_id AND s.judge_id = ?
+    ORDER BY u.name
+", [$judge_id])->fetchAll();
+
+// Get scores given by this judge
+$scores = [];
+if ($judge_id) {
+    $scores = $db->query("
+        SELECT s.*, u.name as user_name 
+        FROM scores s 
+        JOIN users u ON s.user_id = u.id 
+        WHERE s.judge_id = ? 
+        ORDER BY s.created_at DESC
+    ", [$judge_id])->fetchAll();
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Score Board - Judge Portal</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css">
+    <link href="/public/css/styles.css" rel="stylesheet">
+    <!-- Add custom page styles -->
+    <style>
+        .judge-selection-card {
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+        }
+        .judge-selection-card:hover {
+            transform: translateY(-10px);
+            border-color: var(--primary);
+        }
+        .judge-avatar {
+            width: 80px;
+            height: 80px;
+            background-color: var(--primary);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 1rem;
+            font-size: 2rem;
+        }
+        .score-range-container {
+            position: relative;
+            padding: 1rem 0;
+        }
+        .score-value-indicator {
+            position: absolute;
+            top: -30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background-color: var(--primary);
+            color: white;
+            padding: 0.25rem 0.75rem;
+            border-radius: 1rem;
+            font-weight: bold;
+            transition: all 0.2s ease;
+        }
+        .score-range-marks {
+            display: flex;
+            justify-content: space-between;
+            padding: 0 10px;
+            margin-top: 5px;
+        }
+        .score-range-marks span {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+        .nav-indicator {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background-color: var(--primary);
+            z-index: 1001;
+            width: 0;
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation indicator -->  
+    <div class="nav-indicator"></div>
+    
+    <!-- Navigation Bar -->
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/"><span class="highlight">Score</span> Board</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="/public/"><i class="bi bi-trophy"></i> Scoreboard</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link active" href="/judge/"><i class="bi bi-star"></i> Judge Portal</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/admin/"><i class="bi bi-gear"></i> Admin Panel</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="container mt-5">
+        <div class="text-center mb-5">
+            <h1 class="app-title">Judge Portal</h1>
+            <p class="app-subtitle">Assign points to participants</p>
+        </div>
+        
+        <?php if (!$judge): ?>
+            <div class="card mb-4 shadow card-hover-shine animate-fade-in">
+                <div class="card-header bg-primary text-white d-flex align-items-center justify-content-between">
+                    <div>
+                        <i class="bi bi-people-fill me-2"></i>
+                        <h2 class="h4 d-inline mb-0">Available Judges</h2>
+                    </div>
+                    <span class="badge bg-light text-dark"><?php echo count($all_judges); ?> Judges</span>
+                </div>
+                <div class="card-body">
+                    <?php if (empty($all_judges)): ?>
+                        <div class="alert alert-warning d-flex align-items-center">
+                            <div class="icon-circle bg-warning text-white me-3">
+                                <i class="bi bi-exclamation-triangle-fill"></i>
+                            </div>
+                            <div>
+                                <h5 class="mb-1">No Judges Available</h5>
+                                <p class="mb-2">No judges have been registered yet. Please add judges from the Admin Panel.</p>
+                                <a href="/admin/" class="btn btn-primary btn-hover-expand">
+                                    <i class="bi bi-plus-circle me-2"></i> Add Judges
+                                </a>
+                            </div>
+                        </div>
+                    <?php else: ?>
+                        <h5 class="text-center mb-4">Select a judge to continue scoring</h5>
+                        <div class="row row-cols-1 row-cols-md-3 g-4 stagger-children">
+                            <?php foreach ($all_judges as $j): ?>
+                                <div class="col">
+                                    <div class="card h-100 judge-selection-card shadow-sm">
+                                        <div class="card-body text-center p-4">
+                                            <div class="judge-avatar mb-3">
+                                                <i class="bi bi-person"></i>
+                                            </div>
+                                            <h5 class="card-title mb-1"><?php echo htmlspecialchars($j['display_name']); ?></h5>
+                                            <p class="card-text text-muted mb-3">@<?php echo htmlspecialchars($j['username']); ?></p>
+                                            <a href="/judge/?id=<?php echo htmlspecialchars($j['id']); ?>" class="btn btn-primary w-100 btn-hover-expand">
+                                                <i class="bi bi-person-check"></i> Select Judge
+                                            </a>
+                                        </div>
+                                    </div>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        <?php else: ?>
+            <div class="card mb-4 shadow card-hover-shine animate-fade-in">
+                <div class="card-header bg-primary text-white">
+                    <div class="d-flex align-items-center justify-content-between">
+                        <div class="d-flex align-items-center">
+                            <div class="icon-circle bg-primary text-white me-3">
+                                <i class="bi bi-person-circle"></i>
+                            </div>
+                            <div>
+                                <h4 class="mb-1">Welcome, <?php echo htmlspecialchars($judge['display_name']); ?>!</h4>
+                                <p class="mb-0 text-white-50">Judge ID: <?php echo htmlspecialchars($judge['id']); ?></p>
+                            </div>
+                        </div>
+                        <a href="/judge/" class="btn btn-light btn-hover-expand">
+                            <i class="bi bi-arrow-left"></i> Change Judge
+                        </a>
+                    </div>
+                </div>
+                <div class="card-body p-4">
+                    <div class="row mb-4">
+                        <div class="col-md-12">
+                            <div class="d-flex justify-content-between align-items-center mb-4">
+                                <h2 class="h3"><i class="bi bi-star-fill me-2"></i>Assign Scores</h2>
+                                <div>
+                                    <a href="/judge/manage-users.php?id=<?php echo htmlspecialchars($judge_id); ?>" class="btn btn-primary me-2">
+                                        <i class="bi bi-people-fill me-1"></i> Manage Users
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-12">
+                            <div class="alert alert-info">
+                                <i class="bi bi-info-circle-fill me-2"></i>
+                                <strong>Note:</strong> You can assign a score to each participant only once. You can edit your scores at any time.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-12">
+                            <h5 class="mb-4"><i class="bi bi-people-fill me-2"></i>Participants & Scores</h5>
+                            
+                            <div class="table-responsive">
+                                <table class="table table-hover">
+                                    <thead>
+                                        <tr>
+                                            <th width="5%">#</th>
+                                            <th width="30%">Participant</th>
+                                            <th width="15%" class="text-center">Your Score</th>
+                                            <th width="50%" class="text-center">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="stagger-children">
+                                        <?php foreach ($users as $index => $user): 
+                                            $scoreClass = '';
+                                            if ($user['points'] >= 90) {
+                                                $scoreClass = 'bg-success';
+                                            } elseif ($user['points'] >= 70) {
+                                                $scoreClass = 'bg-primary';
+                                            } elseif ($user['points'] >= 50) {
+                                                $scoreClass = 'bg-info';
+                                            } elseif ($user['points'] >= 30) {
+                                                $scoreClass = 'bg-warning';
+                                            } elseif ($user['points'] > 0) {
+                                                $scoreClass = 'bg-danger';
+                                            } else {
+                                                $scoreClass = 'bg-secondary';
+                                            }
+                                        ?>
+                                        <tr>
+                                            <td><?php echo $index + 1; ?></td>
+                                            <td>
+                                                <div class="d-flex align-items-center">
+                                                    <div class="icon-circle bg-secondary text-white me-2" style="width: 2rem; height: 2rem; font-size: 0.8rem;">
+                                                        <?php echo substr(htmlspecialchars($user['name']), 0, 1); ?>
+                                                    </div>
+                                                    <span class="fw-medium"><?php echo htmlspecialchars($user['name']); ?></span>
+                                                </div>
+                                            </td>
+                                            <td class="text-center">
+                                                <span class="points-badge <?php echo $scoreClass; ?>">
+                                                    <?php echo htmlspecialchars($user['points']); ?>
+                                                </span>
+                                            </td>
+                                            <td class="text-center">
+                                                <?php if ($user['has_voted']): ?>
+                                                <button type="button" class="btn btn-primary edit-score-btn"
+                                                        data-bs-toggle="modal" data-bs-target="#editScoreModal"
+                                                        data-user-id="<?php echo htmlspecialchars($user['id']); ?>"
+                                                        data-user-name="<?php echo htmlspecialchars($user['name']); ?>"
+                                                        data-points="<?php echo htmlspecialchars($user['points']); ?>"
+                                                        title="Edit Score">
+                                                <i class="bi bi-pencil-square"></i>
+                                                </button>
+                                                <?php else: ?>
+                                                <button type="button" class="btn btn-outline-primary add-score-btn"
+                                                        data-bs-toggle="modal" data-bs-target="#editScoreModal"
+                                                        data-user-id="<?php echo htmlspecialchars($user['id']); ?>"
+                                                        data-user-name="<?php echo htmlspecialchars($user['name']); ?>"
+                                                        data-points="0">
+                                                <i class="bi bi-plus-circle me-1"></i> Assign Score
+                                                </button>
+                                                <?php endif; ?>
+                                            </td>
+                                        </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card shadow card-hover-shine animate-fade-in">
+                <div class="card-header bg-secondary text-white d-flex align-items-center justify-content-between">
+                    <div>
+                        <i class="bi bi-clock-history me-2"></i>
+                        <h2 class="h4 d-inline mb-0">Your Recent Scores</h2>
+                    </div>
+                    <?php if (!empty($scores)): ?>
+                    <span class="badge bg-light text-dark"><?php echo count($scores); ?> Entries</span>
+                    <?php endif; ?>
+                </div>
+                <div class="card-body p-4">
+                    <?php if (empty($scores)): ?>
+                    <div class="alert alert-info d-flex align-items-center">
+                        <div class="icon-circle bg-info text-white me-3">
+                            <i class="bi bi-info-circle-fill"></i>
+                        </div>
+                        <div>
+                            <h5 class="mb-1">No Scores Yet</h5>
+                            <p class="mb-0">You haven't assigned any scores yet. Use the form above to start scoring participants.</p>
+                        </div>
+                    </div>
+                    <?php else: ?>
+                    <div class="table-responsive">
+                        <table class="table table-hover">
+                            <thead>
+                                <tr>
+                                    <th width="40%"><i class="bi bi-person-fill me-1"></i> Participant</th>
+                                    <th width="30%" class="text-center"><i class="bi bi-trophy-fill me-1"></i> Points</th>
+                                    <th width="30%"><i class="bi bi-calendar-event me-1"></i> Date & Time</th>
+                                </tr>
+                            </thead>
+                            <tbody class="stagger-children">
+                                <?php foreach ($scores as $index => $score): 
+                                    $scoreClass = '';
+                                    if ($score['points'] >= 90) {
+                                        $scoreClass = 'bg-success';
+                                    } elseif ($score['points'] >= 70) {
+                                        $scoreClass = 'bg-primary';
+                                    } elseif ($score['points'] >= 50) {
+                                        $scoreClass = 'bg-info';
+                                    } elseif ($score['points'] >= 30) {
+                                        $scoreClass = 'bg-warning';
+                                    } elseif ($score['points'] > 0) {
+                                        $scoreClass = 'bg-danger';
+                                    } else {
+                                        $scoreClass = 'bg-secondary';
+                                    }
+                                ?>
+                                <tr>
+                                    <td>
+                                        <div class="d-flex align-items-center">
+                                            <div class="icon-circle bg-secondary text-white me-2" style="width: 2rem; height: 2rem; font-size: 0.8rem;">
+                                                <?php echo substr(htmlspecialchars($score['user_name']), 0, 1); ?>
+                                            </div>
+                                            <span class="fw-medium"><?php echo htmlspecialchars($score['user_name']); ?></span>
+                                        </div>
+                                    </td>
+                                    <td class="text-center">
+                                        <span class="points-badge <?php echo $scoreClass; ?>">
+                                            <?php echo htmlspecialchars($score['points']); ?>
+                                        </span>
+                                    </td>
+                                    <td>
+                                        <div class="d-flex align-items-center">
+                                            <i class="bi bi-clock me-2 text-secondary"></i>
+                                            <span><?php echo htmlspecialchars(date('M d, Y g:i A', strtotime($score['created_at']))); ?></span>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        <?php endif; ?>
+    </div>
+    
+    <!-- Edit Score Modal -->
+    <div class="modal fade" id="editScoreModal" tabindex="-1" aria-labelledby="editScoreModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="editScoreModalLabel"><i class="bi bi-star-fill"></i> Assign Score</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <form method="POST">
+                    <div class="modal-body p-4">
+                        <input type="hidden" name="action" value="assign_points">
+                        <input type="hidden" name="judge_id" value="<?php echo htmlspecialchars($judge_id); ?>">
+                        <input type="hidden" name="user_id" id="modal_user_id">
+                        
+                        <div class="text-center mb-4">
+                            <div class="avatar-circle mx-auto mb-3 d-flex align-items-center justify-content-center bg-primary-light" style="width: 80px; height: 80px; border-radius: 50%;">
+                                <i class="bi bi-person-fill text-primary" style="font-size: 2.5rem;"></i>
+                            </div>
+                            <h4 id="modal_user_name" class="mb-1 fw-bold">User Name</h4>
+                            <div class="badge bg-light text-secondary px-3 py-2">
+                                <i class="bi bi-info-circle me-1"></i> Assign a score between 0 and 100
+                            </div>
+                        </div>
+                        
+                        <div class="score-range-container position-relative mb-4 px-3">
+                            <div id="modal-score-indicator" class="score-value-indicator position-absolute translate-middle-x px-3 py-1 rounded-pill bg-primary text-white fw-bold" style="top: -15px; transition: all 0.3s ease;">50</div>
+                            <input type="range" class="form-range" id="modal-points-range" min="0" max="100" step="1" value="50" oninput="updateModalPointsValue(this.value)" style="height: 8px;">
+                            <div class="score-range-marks d-flex justify-content-between mt-2">
+                                <span>0</span>
+                                <span>25</span>
+                                <span>50</span>
+                                <span>75</span>
+                                <span>100</span>
+                            </div>
+                        </div>
+                        
+                        <div class="input-group mb-4">
+                            <span class="input-group-text bg-primary text-white"><i class="bi bi-trophy-fill"></i></span>
+                            <input type="number" class="form-control" id="modal_points" name="points" min="0" max="100" value="50" oninput="updateModalRangeValue(this.value)">
+                            <span class="input-group-text bg-light">points</span>
+                        </div>
+                        
+                        <div class="d-flex justify-content-between gap-2">
+                            <button type="button" class="btn btn-sm flex-grow-1 btn-outline-secondary" onclick="setModalPoints(0)">0</button>
+                            <button type="button" class="btn btn-sm flex-grow-1 btn-outline-danger" onclick="setModalPoints(25)">25</button>
+                            <button type="button" class="btn btn-sm flex-grow-1 btn-outline-warning" onclick="setModalPoints(50)">50</button>
+                            <button type="button" class="btn btn-sm flex-grow-1 btn-outline-info" onclick="setModalPoints(75)">75</button>
+                            <button type="button" class="btn btn-sm flex-grow-1 btn-outline-success" onclick="setModalPoints(100)">100</button>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">
+                            <i class="bi bi-x-circle me-1"></i> Cancel
+                        </button>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-check-circle me-1"></i> Save Score
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Footer -->
+    <footer class="footer mt-5">
+        <div class="container">
+            <div class="row">
+                <div class="col-md-6">
+                    <h5><span class="highlight">Score</span> Board</h5>
+                    <p>A comprehensive solution for managing judges and scoring participants in events.</p>
+                </div>
+                <div class="col-md-3">
+                    <h5>Quick Links</h5>
+                    <ul class="list-unstyled">
+                        <li><a href="/public/" class="text-white">Scoreboard</a></li>
+                        <li><a href="/judge/" class="text-white">Judge Portal</a></li>
+                        <li><a href="/admin/" class="text-white">Admin Panel</a></li>
+                    </ul>
+                </div>
+                <div class="col-md-3">
+                    <h5>About</h5>
+                    <p>Built on LAMP stack technology. Version 1.0.0</p>
+                </div>
+            </div>
+            <hr class="mt-4">
+            <div class="text-center">
+                <p>&copy; <?php echo date('Y'); ?> Score Board. All rights reserved.</p>
+            </div>
+        </div>
+    </footer>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="/public/js/toast.js"></script>
+    <script>
+        // Display toast notification if available in session
+        document.addEventListener('DOMContentLoaded', function() {
+            <?php if (isset($_SESSION['toast'])): ?>
+            // Display toast notification
+            toast.show({
+                type: '<?php echo $_SESSION['toast']['type']; ?>',
+                title: '<?php echo addslashes($_SESSION['toast']['title']); ?>',
+                message: '<?php echo addslashes($_SESSION['toast']['message']); ?>',
+                duration: 5000
+            });
+            <?php 
+            // Clear the toast message from session after displaying
+            unset($_SESSION['toast']);
+            endif; ?>
+            
+            // Set up edit score modal
+            const editScoreBtns = document.querySelectorAll('.edit-score-btn, .add-score-btn');
+            editScoreBtns.forEach(btn => {
+                btn.addEventListener('click', function() {
+                    const userId = this.getAttribute('data-user-id');
+                    const userName = this.getAttribute('data-user-name');
+                    const points = this.getAttribute('data-points');
+                    
+                    document.getElementById('modal_user_id').value = userId;
+                    document.getElementById('modal_user_name').innerText = userName;
+                    document.getElementById('modal_points').value = points;
+                    document.getElementById('modal-points-range').value = points;
+                    
+                    // Update the score indicator
+                    updateModalPointsValue(points);
+                });
+            });
+        });
+        
+        // Modal functions for score slider
+        function updateModalPointsValue(val) {
+            document.getElementById('modal_points').value = val;
+            document.getElementById('modal-score-indicator').innerText = val;
+            
+            // Update indicator position
+            const indicator = document.getElementById('modal-score-indicator');
+            const range = document.getElementById('modal-points-range');
+            const percentage = (val - range.min) / (range.max - range.min);
+            const leftPosition = percentage * 100;
+            indicator.style.left = `${leftPosition}%`;
+            
+            // Update indicator color based on score
+            if (val >= 90) {
+                indicator.style.backgroundColor = 'var(--success)';
+            } else if (val >= 70) {
+                indicator.style.backgroundColor = 'var(--primary)';
+            } else if (val >= 50) {
+                indicator.style.backgroundColor = 'var(--info, #0dcaf0)';
+            } else if (val >= 30) {
+                indicator.style.backgroundColor = 'var(--warning)';
+            } else {
+                indicator.style.backgroundColor = 'var(--danger)';
+            }
+        }
+        
+        // Function to update range slider from points input
+        function updateModalRangeValue(val) {
+            document.getElementById('modal-points-range').value = val;
+            updateModalPointsValue(val);
+        }
+        
+        // Function to set points to a specific value
+        function setModalPoints(val) {
+            document.getElementById('modal_points').value = val;
+            document.getElementById('modal-points-range').value = val;
+            updateModalPointsValue(val);
+        }
+        
+        // Navigation indicator
+        function updateNavIndicator() {
+            const indicator = document.querySelector('.nav-indicator');
+            const winScroll = document.body.scrollTop || document.documentElement.scrollTop;
+            const height = document.documentElement.scrollHeight - document.documentElement.clientHeight;
+            const scrolled = (winScroll / height) * 100;
+            indicator.style.width = scrolled + '%';
+        }
+        
+        // Document ready function
+        document.addEventListener('DOMContentLoaded', function() {
+            // Add animation class to cards with delay
+            const cards = document.querySelectorAll('.card');
+            cards.forEach((card, index) => {
+                setTimeout(() => {
+                    card.classList.add('animate-fade-in');
+                }, index * 150);
+            });
+            
+            // Add hover effects to table rows
+            const tableRows = document.querySelectorAll('tbody tr');
+            tableRows.forEach(row => {
+                row.addEventListener('mouseenter', function() {
+                    this.style.transform = 'translateY(-2px)';
+                    this.style.boxShadow = '0 4px 6px rgba(0, 0, 0, 0.1)';
+                    this.style.transition = 'all 0.3s ease';
+                    this.style.zIndex = '1';
+                });
+                
+                row.addEventListener('mouseleave', function() {
+                    this.style.transform = 'translateY(0)';
+                    this.style.boxShadow = 'none';
+                    this.style.zIndex = 'auto';
+                });
+            });
+        });
+        
+        // Add scroll event listener for navigation indicator
+        window.addEventListener('scroll', updateNavIndicator);
+    </script>
+</body>
+</html>
